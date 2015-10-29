@@ -185,10 +185,13 @@ static int ratelimit_seq_show(struct seq_file *s, void *v)
 	struct xt_ratelimit_htable *ht = s->private;
 	unsigned int *bucket = (unsigned int *)v;
 	struct ratelimit_match *mt;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
+	struct hlist_node *pos;
+#endif
 
 	/* print everything from the bucket at once */
 	if (!hlist_empty(&ht->hash[*bucket])) {
-		hlist_for_each_entry(mt, &ht->hash[*bucket], node)
+		compat_hlist_for_each_entry(mt, pos, &ht->hash[*bucket], node)
 			if (ratelimit_seq_ent_show(mt, s))
 				return -1;
 	}
@@ -196,7 +199,7 @@ static int ratelimit_seq_show(struct seq_file *s, void *v)
 }
 
 static void *ratelimit_seq_start(struct seq_file *s, loff_t *pos)
-	__acquires(ht->lock)
+	__acquires(&ht->lock)
 {
 	struct xt_ratelimit_htable *ht = s->private;
 	unsigned int *bucket;
@@ -227,7 +230,7 @@ static void *ratelimit_seq_next(struct seq_file *s, void *v, loff_t *pos)
 }
 
 static void ratelimit_seq_stop(struct seq_file *s, void *v)
-	__releases(ht->lock)
+	__releases(&ht->lock)
 {
 	struct xt_ratelimit_htable *ht = s->private;
 	unsigned int *bucket = (unsigned int *)v;
@@ -263,21 +266,35 @@ static void ratelimit_ent_del(struct xt_ratelimit_htable *ht, struct ratelimit_e
 
 static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 {
-	char * const buf = str;
+	char * const buf = str; /* for logging only */
 	const char *p;
+	const char * const endp = str + size;
 	struct ratelimit_ent *ent;
 	struct ratelimit_ent *ent_chk;
 	__be32 addr;
 	int ent_size;
 	int add;
 	int i;
+	int ptok = 0;
+	int warn = 1;
 
-	if (!size)
+	/* make sure that size is enough for two decrements */
+	if (size < 2 || !str || !ht)
 		return -EINVAL;
+
+	/* strip trailing newline for better formatting of error messages */
+	str[--size] = '\0';
 
 	/* rule format is: +address[,address...] [keyword value]...
 	 * address set is unique key for parameters,
 	 * address should not duplicate */
+	if (*str == '@') {
+		warn = 0; /* hide redundant deletion warning */
+		++str;
+		size--;
+	}
+	if (size < 1)
+		return -EINVAL;
 	switch (*str) {
 		case '\n':
 		case '#':
@@ -295,25 +312,24 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 			pr_err("Rule should start with '+', '-', or '/'\n");
 			return -EINVAL;
 	}
-
-	/* strip trailing newline for better formatting of error messages */
-	str[--size] = '\0';
 	++str;
 	--size;
 
 	/* determine address set size */
 	ent_size = 0;
-	for (p = str; in4_pton(p, size - (p - str), (u8 *)&addr, -1, &p); ++p) {
+	for (p = str;
+	    p < endp && *p && (ptok = in4_pton(p, size - (p - str), (u8 *)&addr, -1, &p));
+	    ++p) {
 		++ent_size;
-		if (*p == ' ' || p >= &str[size])
+		if (p >= endp || !*p || *p == ' ')
 			break;
 		else if (*p != ',') {
 			pr_err("IP addresses should be separated with ',' (cmd: %s)\n", buf);
 			return -EINVAL;
 		}
 	}
-	if (!ent_size) {
-		pr_err("Empty IP address list (cmd: %s)\n", buf);
+	if (!ptok || (p < endp && *p && *p != ' ') || !ent_size) {
+		pr_err("Invalid IP address list (cmd: %s)\n", buf);
 		return -EINVAL;
 	}
 
@@ -323,40 +339,45 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 		return -ENOMEM;
 
 	spin_lock_init(&ent->lock_bh);
-	for (i = 0, p = str; in4_pton(p, size - (p - str), (u8 *)&addr, -1, &p); ++p, ++i) {
+	for (i = 0, p = str;
+	    p < endp && *p && in4_pton(p, size - (p - str), (u8 *)&addr, -1, &p);
+	    ++p, ++i) {
 		struct ratelimit_match *mt = &ent->matches[i];
 		int j;
 
+		BUG_ON(i >= ent_size);
 		mt->addr = addr;
 		mt->ent = ent;
 		++ent->mtcnt;
 		/* there should not be duplications,
-		 * this is also importnat for below test of mtcnt */
+		 * this is also important for below test of mtcnt */
 		for (j = 0; j < i; ++j)
 			if (ent->matches[j].addr == addr) {
 				pr_err("Duplicated IP address %pI4 in list (cmd: %s)\n", &addr, buf);
 				kvfree(ent);
 				return -EINVAL;
 			}
-		if (*p == ' ' || p >= &str[size])
+		if (p >= endp || !*p || *p == ' ')
 			break;
 	}
 	BUG_ON(ent->mtcnt != ent_size);
 
 	/* parse parameters */
-	str = (char *)p;
+	str = (char *)p; /* strip const, also reset 'str' */
 	if (add) /* unindented */
-	for (i = 0; *p; ++i) {
+	for (i = 0; p < endp && *p; ++i) {
 		const char *v;
 		unsigned int val;
 
-		while (*p == ' ')
+		while (p < endp && *p == ' ')
 			++p;
 		v = p;
-		while (*p && *p != ' ')
+		while (p < endp && *p && *p != ' ')
 			++p;
 		if (v == p) {
 			if (i == 0) {
+				/* error if no parameters */
+				pr_err("Add op should have arguments (cmd: %s)\n", buf);
 				kvfree(ent);
 				return -EINVAL;
 			} else
@@ -395,14 +416,14 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 			ent_chk = tent;
 		if (tent != ent_chk) {
 			/* no operation should reference multiple entries */
-			pr_err("IP addresss %pI4 from multiple rules (cmd: %s)\n",
-			   &mt->addr,  buf);
+			pr_err("IP address %pI4 from multiple rules (cmd: %s)\n",
+			    &mt->addr,  buf);
 			goto unlock_einval;
 		}
 	}
 
 	if (add) {
-		/* add op should not reerence any existing entries */
+		/* add op should not reference any existing entries */
 		if (ent_chk) {
 			pr_err("Add op references existing address (cmd: %s)\n", buf);
 			goto unlock_einval;
@@ -412,7 +433,8 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 		 * should be equal (this is correct, because duplications
 		 * inside of set(s) are impossible) */
 		if (!ent_chk) {
-			pr_err("Del op doesn't reference any existing address (cmd: %s)\n", buf);
+			if (warn)
+				pr_err("Del op doesn't reference any existing address (cmd: %s)\n", buf);
 			goto unlock_einval;
 		}
 		if (ent_chk->mtcnt != ent->mtcnt) {
@@ -438,32 +460,36 @@ unlock_einval:
 	return -EINVAL;
 }
 
+static char proc_buf[4000];
+
 static ssize_t
 ratelimit_proc_write(struct file *file, const char __user *input,
     size_t size, loff_t *loff)
 {
-	char buf[1024];
 	struct xt_ratelimit_htable *ht = PDE_DATA(file_inode(file));
 	char *p;
 
-	if (!size)
+	if (!size || !input | !ht)
 		return 0;
-	if (size > sizeof(buf))
-		size = sizeof(buf);
-	if (copy_from_user(buf, input, size) != 0)
+	if (size > sizeof(proc_buf))
+		size = sizeof(proc_buf);
+	if (copy_from_user(proc_buf, input, size) != 0)
 		return -EFAULT;
 
-	for (p = buf; p < &buf[size]; ) {
+	for (p = proc_buf; p < &proc_buf[size]; ) {
 		char *str = p;
 
-		while (p < &buf[size] && *p != '\n')
+		while (p < &proc_buf[size] && *p != '\n')
 			++p;
-		if (*p != '\n') {
-			/* untermianted command */
-			if (str == buf) {
+		if (p == &proc_buf[size] || *p != '\n') {
+			/* unterminated command */
+			if (str == proc_buf) {
 				pr_err("Rule should end with '\\n'\n");
 				return -EINVAL;
 			} else {
+				/* Rewind to the beginning of incomplete
+				 * command for smarter writers, this doesn't
+				 * help for `cat`, though. */
 				p = str;
 				break;
 			}
@@ -473,8 +499,8 @@ ratelimit_proc_write(struct file *file, const char __user *input,
 			return -EINVAL;
 	}
 
-	*loff += p - buf;
-	return p - buf;
+	*loff += p - proc_buf;
+	return p - proc_buf;
 }
 
 static const struct file_operations ratelimit_fops = {
@@ -545,23 +571,15 @@ ratelimit_match_find(const struct xt_ratelimit_htable *ht,
 
 	if (!hlist_empty(&ht->hash[hash])) {
 		struct ratelimit_match *mt;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
+		struct hlist_node *pos;
+#endif
 
-		hlist_for_each_entry_rcu(mt, &ht->hash[hash], node)
+		compat_hlist_for_each_entry_rcu(mt, pos, &ht->hash[hash], node)
 			if (mt->addr == addr)
 				return mt->ent;
 	}
 	return NULL;
-}
-static struct ratelimit_ent *
-ratelimit_match_find_lock(const struct xt_ratelimit_htable *ht,
-    const __be32 addr)
-	/* under rcu bh */
-{
-	struct ratelimit_ent *ent = ratelimit_match_find(ht, addr);
-
-	if (ent)
-		spin_lock(&ent->lock_bh);
-	return ent;
 }
 
 static struct ratelimit_ent *
@@ -621,9 +639,12 @@ static void htable_cleanup(struct xt_ratelimit_htable *ht)
 	for (i = 0; i < ht->size; i++) {
 		struct ratelimit_match *mt;
 		struct hlist_node *n;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
+		struct hlist_node *pos;
+#endif
 
 		spin_lock(&ht->lock);
-		hlist_for_each_entry_safe(mt, n, &ht->hash[i], node) {
+		compat_hlist_for_each_entry_safe(mt, pos, n, &ht->hash[i], node) {
 			ratelimit_match_free(ht, mt);
 		}
 		spin_unlock(&ht->lock);
@@ -693,8 +714,11 @@ static int htable_get(struct net *net,
 {
 	struct ratelimit_net *ratelimit_net = ratelimit_pernet(net);
 	struct xt_ratelimit_htable *ht;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
+	struct hlist_node *pos;
+#endif
 
-	hlist_for_each_entry(ht, &ratelimit_net->htables, node) {
+	compat_hlist_for_each_entry(ht, pos, &ratelimit_net->htables, node) {
 		if (!strcmp(minfo->name, ht->name)) {
 			ht->use++;
 			minfo->ht = ht;
@@ -733,12 +757,13 @@ ratelimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 		addr = ip_hdr(skb)->saddr;
 
 	rcu_read_lock();
-	ent = ratelimit_match_find_lock(ht, addr);
+	ent = ratelimit_match_find(ht, addr);
 	if (ent) {
 		struct ratelimit_car *car = &ent->car;
 		const unsigned int len = skb->len; /* L3 */
 		const unsigned long delta_ms = (now - car->last) * (MSEC_PER_SEC / HZ);
 
+		spin_lock(&ent->lock_bh);
 		car->tc += len;
 		if (delta_ms) {
 			const u32 tok = delta_ms * (car->cir / (BITS_PER_BYTE * MSEC_PER_SEC));
@@ -828,9 +853,12 @@ static void __net_exit ratelimit_net_exit(struct net *net)
 {
 	struct ratelimit_net *ratelimit_net = ratelimit_pernet(net);
 	struct xt_ratelimit_htable *ht;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
+	struct hlist_node *pos;
+#endif
 
 	mutex_lock(&ratelimit_mutex);
-	hlist_for_each_entry(ht, &ratelimit_net->htables, node)
+	compat_hlist_for_each_entry(ht, pos, &ratelimit_net->htables, node)
 		remove_proc_entry(ht->name, ratelimit_net->ipt_ratelimit);
 	ratelimit_net->ipt_ratelimit = NULL; /* for htable_destroy() */
 	mutex_unlock(&ratelimit_mutex);

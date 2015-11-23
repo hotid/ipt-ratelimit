@@ -43,7 +43,7 @@
 #include "compat.h"
 #include "xt_ratelimit.h"
 
-#define XT_RATELIMIT_VERSION "0.1"
+#define XT_RATELIMIT_VERSION "0.2"
 #include "version.h"
 #ifdef GIT_VERSION
 # undef XT_RATELIMIT_VERSION
@@ -124,6 +124,7 @@ struct xt_ratelimit_htable {
 	unsigned int mt_count;		/* currently matches in the hash */
 	unsigned int ent_count;		/* currently entities linked */
 	unsigned int size;		/* hash array size */
+	int other;			/* what to do with 'other' packets */
 	struct net *net;		/* for destruction */
 	struct proc_dir_entry *pde;
 	char name[XT_RATELIMIT_NAME_LEN];
@@ -269,8 +270,8 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 	char * const buf = str; /* for logging only */
 	const char *p;
 	const char * const endp = str + size;
-	struct ratelimit_ent *ent;
-	struct ratelimit_ent *ent_chk;
+	struct ratelimit_ent *ent;	/* new entry */
+	struct ratelimit_ent *ent_chk;	/* old entry */
 	__be32 addr;
 	int ent_size;
 	int add;
@@ -291,7 +292,7 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 	if (*str == '@') {
 		warn = 0; /* hide redundant deletion warning */
 		++str;
-		size--;
+		--size;
 	}
 	if (size < 1)
 		return -EINVAL;
@@ -301,6 +302,20 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 			return 0;
 		case '/': /* flush table */
 			ratelimit_table_flush(ht);
+			return 0;
+		case ':':
+			++str;
+			--size;
+			if (strcmp(str, "hotdrop") == 0)
+				ht->other = OT_HOTDROP;
+			else if (strcmp(str, "match") == 0)
+				ht->other = OT_MATCH;
+			else if (strcmp(str, "nomatch") == 0)
+				ht->other = OT_ZERO;
+			else if (strcmp(str, "flush") == 0)
+				ratelimit_table_flush(ht);
+			else
+				return -EINVAL;
 			return 0;
 		case '-':
 			add = false;
@@ -424,7 +439,8 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 
 	if (add) {
 		/* add op should not reference any existing entries */
-		if (ent_chk) {
+		/* unless it's update op (which is quiet add) */
+		if (warn && ent_chk) {
 			pr_err("Add op references existing address (cmd: %s)\n", buf);
 			goto unlock_einval;
 		}
@@ -444,8 +460,15 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 	}
 
 	if (add) {
-		ratelimit_ent_add(ht, ent);
-		ent = NULL;
+		if (ent_chk) {
+			/* update */
+			spin_lock_bh(&ent_chk->lock_bh);
+			ent_chk->car = ent->car;
+			spin_unlock_bh(&ent_chk->lock_bh);
+		} else {
+			ratelimit_ent_add(ht, ent);
+			ent = NULL;
+		}
 	} else
 		ratelimit_ent_del(ht, ent_chk);
 	spin_unlock(&ht->lock);
@@ -522,7 +545,7 @@ static int htable_create(struct net *net, struct xt_ratelimit_mtinfo *minfo)
 	unsigned int sz; /* (bytes) */
 	int i;
 
-	if (hsize < 0 || hsize > 1000000)
+	if (hsize > 1000000)
 		hsize = 8192;
 
 	sz = sizeof(struct xt_ratelimit_htable) + sizeof(struct hlist_head) * hsize;
@@ -789,6 +812,11 @@ ratelimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 			ent->stat.green_pkt++;
 		}
 		spin_unlock(&ent->lock_bh);
+	} else {
+		if (ht->other == OT_MATCH)
+			match = true; /* match is drop */
+		else if (ht->other == OT_HOTDROP)
+			par->hotdrop = true;
 	}
 
 	rcu_read_unlock();
